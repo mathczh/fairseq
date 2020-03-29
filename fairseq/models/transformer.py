@@ -240,6 +240,40 @@ class TransformerModel(FairseqEncoderDecoderModel):
 
     # TorchScript doesn't support optional arguments with variable length (**kwargs).
     # Current workaround is to add union of all arguments in child classes.
+    def embed_forward(
+            self,
+            src_token,
+            src_embed,
+            tar_token,
+            tar_embed,
+            src_lengths,
+            cls_input: Optional[Tensor] = None,
+            return_all_hiddens: bool = True,
+            features_only: bool = False,
+            alignment_layer: Optional[int] = None,
+            alignment_heads: Optional[int] = None,
+        ):
+        encoder_out = self.encoder.embed_forward(
+            src_token,
+            src_embed,
+            cls_input=cls_input,
+            return_all_hiddens=return_all_hiddens,
+        )
+        decoder_out = self.decoder.embed_forward(
+            tar_embed,
+            prev_output_tokens=tar_token,
+            encoder_out=encoder_out,
+            features_only=features_only,
+            alignment_layer=alignment_layer,
+            alignment_heads=alignment_heads,
+            src_lengths=src_lengths,
+            return_all_hiddens=return_all_hiddens,
+        )
+        return decoder_out
+
+
+
+
     def forward(
         self,
         src_tokens,
@@ -271,6 +305,7 @@ class TransformerModel(FairseqEncoderDecoderModel):
             alignment_heads=alignment_heads,
             src_lengths=src_lengths,
             return_all_hiddens=return_all_hiddens,
+
         )
         return decoder_out
 
@@ -423,6 +458,48 @@ class TransformerEncoder(FairseqEncoder):
             x = self.layernorm_embedding(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
         return x, embed
+    
+    
+    def embed_forward(
+            self,
+            src_tokens,
+            embed,
+            cls_input: Optional[Tensor] = None,
+            return_all_hiddens: bool = False,
+    ):
+        if self.embed_positions is not None:
+            x = embed + self.embed_positions(src_tokens)
+        if self.layernorm_embedding is not None:
+            x = self.layernorm_embedding(x)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        x = x.transpose(0, 1)
+
+        # compute padding mask
+        encoder_padding_mask = src_tokens.eq(self.padding_idx)
+
+        encoder_states = [] if return_all_hiddens else None
+
+        # encoder layers
+        for layer in self.layers:
+            # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
+            dropout_probability = torch.empty(1).uniform_()
+            if not self.training or (dropout_probability > self.encoder_layerdrop):
+                x = layer(x, encoder_padding_mask)
+                if return_all_hiddens:
+                    assert encoder_states is not None
+                    encoder_states.append(x)
+
+        if self.layer_norm is not None:
+            x = self.layer_norm(x)
+            if return_all_hiddens:
+                encoder_states[-1] = x
+
+        return EncoderOut(
+            encoder_out=x,  # T x B x C
+            encoder_padding_mask=encoder_padding_mask,  # B x T
+            #encoder_embedding=encoder_embedding,  # B x T x C
+            encoder_states=encoder_states,  # List[T x B x C]
+        )
 
     def forward(
         self,
@@ -456,7 +533,6 @@ class TransformerEncoder(FairseqEncoder):
             return_all_hiddens = True
 
         x, encoder_embedding = self.forward_embedding(src_tokens)
-
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
 
@@ -676,6 +752,121 @@ class TransformerDecoder(FairseqIncrementalDecoder):
 
     def build_decoder_layer(self, args, no_encoder_attn=False):
         return TransformerDecoderLayer(args, no_encoder_attn)
+
+    def forward_embeding(
+            self,
+            prev_output_tokens,
+    ):
+        x = self.embed_scale * self.embed_tokens(prev_output_tokens)
+        return x
+
+    def embed_forward(
+            self,
+            embed,
+            prev_output_tokens,
+            encoder_out: Optional[EncoderOut] = None,
+            incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
+            features_only: bool = False,
+            alignment_layer: Optional[int] = None,
+            alignment_heads: Optional[int] = None,
+            full_context_alignment: bool = False,
+            src_lengths: Optional[Any] = None,
+            return_all_hiddens: bool = False,
+    ):
+        if alignment_layer is None:
+            alignment_layer = self.num_layers - 1
+
+        # embed positions
+        positions = (
+            self.embed_positions(
+                prev_output_tokens, incremental_state=incremental_state
+            )
+            if self.embed_positions is not None
+            else None
+        )
+
+        if incremental_state is not None:
+            prev_output_tokens = prev_output_tokens[:, -1:]
+            if positions is not None:
+                positions = positions[:, -1:]
+
+        x = embed
+        
+        if self.project_in_dim is not None:
+            x = self.project_in_dim(x)
+
+        if positions is not None:
+            x += positions
+
+        if self.layernorm_embedding is not None:
+            x = self.layernorm_embedding(x)
+
+        x = F.dropout(x, p=self.dropout, training=self.training)
+
+        # B x T x C -> T x B x C
+        x = x.transpose(0, 1)
+
+        self_attn_padding_mask: Optional[Tensor] = None
+        if self.cross_self_attention or prev_output_tokens.eq(self.padding_idx).any():
+            self_attn_padding_mask = prev_output_tokens.eq(self.padding_idx)
+
+        # decoder layers
+        attn: Optional[Tensor] = None
+        inner_states: List[Optional[Tensor]] = [x]
+        for idx, layer in enumerate(self.layers):
+            encoder_state: Optional[Tensor] = None
+            if encoder_out is not None:
+                if self.layer_wise_attention:
+                    encoder_states = encoder_out.encoder_states
+                    assert encoder_states is not None
+                    encoder_state = encoder_states[idx]
+                else:
+                    encoder_state = encoder_out.encoder_out
+
+            if incremental_state is None and not full_context_alignment:
+                self_attn_mask = self.buffered_future_mask(x)
+            else:
+                self_attn_mask = None
+
+            # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
+            dropout_probability = torch.empty(1).uniform_()
+            if not self.training or (dropout_probability > self.decoder_layerdrop):
+                x, layer_attn, _ = layer(
+                    x,
+                    encoder_state,
+                    encoder_out.encoder_padding_mask
+                    if encoder_out is not None
+                    else None,
+                    incremental_state,
+                    self_attn_mask=self_attn_mask,
+                    self_attn_padding_mask=self_attn_padding_mask,
+                    need_attn=bool((idx == alignment_layer)),
+                    need_head_weights=bool((idx == alignment_layer)),
+                )
+                inner_states.append(x)
+                if layer_attn is not None and idx == alignment_layer:
+                    attn = layer_attn.float().to(x)
+
+        if attn is not None:
+            if alignment_heads is not None:
+                attn = attn[:alignment_heads]
+
+            # average probabilities over heads
+            attn = attn.mean(dim=0)
+
+        if self.layer_norm is not None:
+            x = self.layer_norm(x)
+
+        # T x B x C -> B x T x C
+        x = x.transpose(0, 1)
+
+        if self.project_out_dim is not None:
+            x = self.project_out_dim(x)
+
+        if not features_only:
+            x = self.output_layer(x)
+
+        return x, {"attn": [attn], "inner_states": inner_states}
 
     def forward(
         self,

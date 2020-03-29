@@ -310,7 +310,17 @@ class Trainer(object):
             try:
                 with maybe_no_sync():
                     # forward and backward
-                    loss, sample_size_i, logging_output = self.task.train_step(
+                    if self.args.vat or self.args.adv:
+                        loss, sample_size_i, logging_output = self.task.vat_train_step(
+                            sample=sample,
+                            model=self.model,
+                            criterion=self.criterion,
+                            optimizer=self.optimizer,
+                            update_num=self.get_num_updates(),
+                            ignore_grad=is_dummy_batch,
+                        )
+                    else:
+                        loss, sample_size_i, logging_output = self.task.train_step(
                         sample=sample,
                         model=self.model,
                         criterion=self.criterion,

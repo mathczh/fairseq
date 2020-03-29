@@ -173,6 +173,7 @@ def train(args, trainer, task, epoch_itr):
     max_update = args.max_update or math.inf
     for samples in progress:
         with metrics.aggregate('train_inner'):
+
             log_output = trainer.train_step(samples)
             if log_output is None:  # OOM, overflow, ...
                 continue

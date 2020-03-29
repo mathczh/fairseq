@@ -67,6 +67,16 @@ class FairseqCriterion(_Loss):
         """
         raise NotImplementedError
 
+    def embed_forward(self, model, sample, embed, reduce=True):
+        """Compute the loss for the given sample and embed.
+
+                Returns a tuple with three elements:
+                1) the loss
+                2) the sample size, which is used as the denominator for the gradient
+                3) logging outputs to display while training
+                """
+        raise NotImplementedError
+
     @staticmethod
     def aggregate_logging_outputs(
         logging_outputs: List[Dict[str, Any]],
